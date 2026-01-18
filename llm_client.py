@@ -1,9 +1,12 @@
+import asyncio
 import base64
+import logging
 import httpx
 
 from config import OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_VISION_MODEL
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+logger = logging.getLogger(__name__)
 
 
 async def call_llm(
@@ -17,20 +20,36 @@ async def call_llm(
     messages.append({"role": "user", "content": prompt})
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": messages,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            try:
+                response = await client.post(
+                    OPENROUTER_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": messages,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except (
+                httpx.RemoteProtocolError,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+            ) as exc:
+                if attempt == 2:
+                    raise
+                backoff = 1
+                logger.warning(
+                    "OpenRouter request failed (%s). Retrying in %ss.",
+                    exc.__class__.__name__,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
 
 
 async def analyze_image(
@@ -58,17 +77,33 @@ async def analyze_image(
     )
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_VISION_MODEL,
-                "messages": messages,
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            try:
+                response = await client.post(
+                    OPENROUTER_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": OPENROUTER_VISION_MODEL,
+                        "messages": messages,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            except (
+                httpx.RemoteProtocolError,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+            ) as exc:
+                if attempt == 2:
+                    raise
+                backoff = 1
+                logger.warning(
+                    "OpenRouter vision request failed (%s). Retrying in %ss.",
+                    exc.__class__.__name__,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)

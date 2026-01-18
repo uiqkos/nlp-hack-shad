@@ -15,6 +15,7 @@ from database import (
     clear_chat_data,
     get_messages_count,
     get_messages_for_problem,
+    get_message_by_telegram_id,
     get_problem_by_id,
     get_problems_by_chat,
     get_unprocessed_messages,
@@ -133,6 +134,11 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = message.chat_id
     text = message.text or ""
     caption = message.caption or ""
+
+    # Если сообщение уже сохранено — не анализируем заново
+    existing = get_message_by_telegram_id(chat_id, message.message_id)
+    if existing and existing.text:
+        return
 
     image_blocks: list[str] = []
     prompt = (
@@ -486,12 +492,25 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def send_long_message(message, text: str, max_length: int = 4096) -> None:
-    """Отправить длинное сообщение, разбив на части."""
+    """Отправить длинное сообщение, разбив на части, с повторными попытками."""
+    async def send_with_retry(part: str) -> None:
+        for attempt in range(3):
+            try:
+                await message.reply_text(part)
+                return
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "Telegram send_message failed (%s). Retrying...",
+                    exc.__class__.__name__,
+                )
+
     if len(text) <= max_length:
-        await message.reply_text(text)
+        await send_with_retry(text)
     else:
         for i in range(0, len(text), max_length):
-            await message.reply_text(text[i : i + max_length])
+            await send_with_retry(text[i : i + max_length])
 
 
 def main() -> None:
