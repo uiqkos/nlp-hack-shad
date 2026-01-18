@@ -268,11 +268,6 @@ def format_summary_for_display(chat_id: int) -> str:
                 )
                 parts.append(f"   {summary_preview}")
 
-    if meta.get("decisions"):
-        parts.append("\n📌 РЕШЕНИЯ")
-        for d in meta["decisions"]:
-            parts.append(f"• {d}")
-
     if meta.get("key_points"):
         parts.append("\n💡 КЛЮЧЕВЫЕ МОМЕНТЫ")
         for k in meta["key_points"]:
