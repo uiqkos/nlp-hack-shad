@@ -112,6 +112,10 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not message or not message.text:
         return
 
+    # Игнорируем сообщения от самого бота
+    if message.from_user and message.from_user.id == context.bot.id:
+        return
+
     chat_id = message.chat_id
 
     # Определяем автора: если пересланное — берём оригинального автора
