@@ -15,6 +15,7 @@ from config import TELEGRAM_BOT_TOKEN
 from database import (
     Message,
     clear_chat_data,
+    get_message_by_telegram_id,
     get_messages_count,
     get_messages_for_problem,
     get_problem_by_id,
@@ -23,9 +24,10 @@ from database import (
     save_message,
     update_problem_status,
 )
+from llm_client import analyze_image
+from query_agent import AgentState, run_query_agent
 from summarizer import (
     analyze_and_update,
-    answer_query,
     format_summary_for_display,
     regenerate_problem_summary,
 )
@@ -87,29 +89,47 @@ def format_author_display(name: str, tag: str) -> str:
     return name
 
 
+HELP_TEXT = """Я бот для суммаризации чатов.
+
+Сохраняю все сообщения (включая картинки) и создаю структурированное резюме с проблемами.
+
+📋 Основные команды:
+/summarize — обработать новые сообщения и показать резюме
+/problems — показать список проблем
+/stats — статистика чата
+
+🔍 Работа с проблемами:
+/problem_N — подробности о проблеме (например /problem_0)
+/messages_N — ссылки на сообщения проблемы
+/solve_N — переключить статус (❌→🔶→✅→❌)
+
+❓ Прочее:
+/query <вопрос> — задать вопрос по резюме
+/clear — очистить все данные чата
+/help — эта справка
+
+Статусы проблем:
+✅ Решено — есть конкретный ответ
+🔶 Есть информация — полезные данные, но решённость под вопросом
+❌ Не решено — нет ответа"""
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка команды /start."""
     user = update.effective_user
     logger.info(f"/start from user {user.id} ({user.first_name})")
-    await update.message.reply_text(
-        "Привет! Я бот для суммаризации чатов.\n\n"
-        "Я сохраняю все сообщения и создаю структурированное резюме с проблемами.\n\n"
-        "Команды:\n"
-        "/summarize — обработать новые сообщения и показать резюме\n"
-        "/problems — показать список проблем\n"
-        "/problem <номер> — подробности о проблеме\n"
-        "/messages <номер> — ссылки на сообщения проблемы\n"
-        "/solve <номер> — отметить проблему решённой\n"
-        "/query <вопрос> — задать вопрос по резюме\n"
-        "/stats — статистика чата\n"
-        "/clear — очистить всё"
-    )
+    await update.message.reply_text(f"Привет!\n\n{HELP_TEXT}")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /help."""
+    await update.message.reply_text(HELP_TEXT)
 
 
 async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сохранять все сообщения в БД."""
+    """Сохранять все сообщения (включая картинки) в БД."""
     message = update.message
-    if not message or not message.text:
+    if not message:
         return
 
     # Игнорируем сообщения от самого бота
@@ -117,6 +137,58 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     chat_id = message.chat_id
+    text = message.text or ""
+    caption = message.caption or ""
+
+    # Если сообщение уже сохранено — не анализируем заново
+    existing = get_message_by_telegram_id(chat_id, message.message_id)
+    if existing and existing.text:
+        return
+
+    image_blocks: list[str] = []
+    prompt = (
+        "Верни строго два блока:\n"
+        "<IMAGE_DESC>краткое описание изображения</IMAGE_DESC>\n"
+        "<IMAGE_TEXT>извлечённый текст с изображения или пусто</IMAGE_TEXT>\n"
+        "Без дополнительных пояснений."
+    )
+    if caption:
+        prompt += f"\n\nПодпись пользователя: {caption}"
+
+    # Обрабатываем фото (одно сообщение может содержать несколько изображений)
+    if message.photo:
+        # Группируем по file_unique_id, чтобы обрабатывать каждое изображение один раз
+        photos_by_id = {}
+        for photo in message.photo:
+            existing_photo = photos_by_id.get(photo.file_unique_id)
+            if not existing_photo or (photo.file_size or 0) > (
+                existing_photo.file_size or 0
+            ):
+                photos_by_id[photo.file_unique_id] = photo
+
+        for photo in photos_by_id.values():
+            try:
+                file = await photo.get_file()
+                image_bytes = await file.download_as_bytearray()
+                image_description = await analyze_image(image_bytes, prompt)
+                image_blocks.append(f"<IMAGE>\n{image_description}\n</IMAGE>")
+            except Exception as e:
+                logger.error(f"Image analysis failed: {e}", exc_info=True)
+                image_blocks.append(
+                    "<IMAGE>\n<IMAGE_DESC>Не удалось проанализировать</IMAGE_DESC>\n"
+                    "<IMAGE_TEXT></IMAGE_TEXT>\n</IMAGE>"
+                )
+
+    if image_blocks:
+        image_list = "<IMAGE_LIST>\n" + "\n".join(image_blocks) + "\n</IMAGE_LIST>"
+        text = (
+            f"{image_list}\n\n{caption or text}".strip()
+            if (caption or text)
+            else image_list
+        )
+
+    if not text:
+        return
 
     # Определяем автора: если пересланное — берём оригинального автора
     author_name = "Unknown"
@@ -167,7 +239,7 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         id=None,
         chat_id=chat_id,
         telegram_msg_id=message.message_id,
-        text=message.text,
+        text=text,
         author_tag=author_tag,
         author_name=author_name,
         author_link=author_link,
@@ -250,17 +322,27 @@ async def problems_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     solved_count = sum(1 for p in problems if p.status == "solved")
-    unsolved_count = len(problems) - solved_count
-    text = f"📋 ПРОБЛЕМЫ ({solved_count}✅ / {unsolved_count}❌)\n\n"
+    partial_count = sum(1 for p in problems if p.status == "partial")
+    unsolved_count = len(problems) - solved_count - partial_count
+    text = (
+        f"📋 ПРОБЛЕМЫ ({solved_count}✅ / {partial_count}🔶 / {unsolved_count}❌)\n\n"
+    )
 
     for i, p in enumerate(problems):
-        status_icon = "✅" if p.status == "solved" else "❌"
+        if p.status == "solved":
+            status_icon = "✅"
+        elif p.status == "partial":
+            status_icon = "🔶"
+        else:
+            status_icon = "❌"
         text += f"/problem_{i} {status_icon} {p.title}\n"
-        if p.short_summary:
+        if p.status in ("solved", "partial") and p.solution:
+            text += f"   💡 Решение: {p.solution}\n"
+        elif p.long_summary:
             text += (
-                f"   {p.short_summary[:100]}...\n"
-                if len(p.short_summary) > 100
-                else f"   {p.short_summary}\n"
+                f"   {p.long_summary[:150]}...\n"
+                if len(p.long_summary) > 150
+                else f"   {p.long_summary}\n"
             )
         text += "\n"
 
@@ -299,18 +381,25 @@ async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     p = problems[idx]
-    status_icon = "✅" if p.status == "solved" else "❌"
-    status_text = "Решено" if p.status == "solved" else "Не решено"
+    if p.status == "solved":
+        status_icon = "✅"
+        status_text = "Решено"
+    elif p.status == "partial":
+        status_icon = "🔶"
+        status_text = "Есть информация"
+    else:
+        status_icon = "❌"
+        status_text = "Не решено"
 
     text = f"🔧 ПРОБЛЕМА #{idx} {status_icon}\n\n"
     text += f"📌 {p.title}\n\n"
     text += f"Статус: {status_text}\n\n"
 
-    if p.short_summary:
-        text += f"Кратко: {p.short_summary}\n\n"
+    if p.solution:
+        text += f"💡 РЕШЕНИЕ:\n{p.solution}\n\n"
 
     if p.long_summary:
-        text += f"Подробно:\n{p.long_summary}\n\n"
+        text += f"Описание:\n{p.long_summary}\n\n"
 
     # Количество связанных сообщений
     msgs = get_messages_for_problem(p.id)
@@ -362,7 +451,7 @@ async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     for m in msgs[:30]:  # Лимит 30 ссылок
         author = format_author_display(m.author_name or "Unknown", m.author_tag)
-        preview = m.text[:50] + "..." if len(m.text) > 50 else m.text
+        preview = m.text[:150] + "..." if len(m.text) > 150 else m.text
         msg_link = m.telegram_link or build_telegram_link(chat_id, m.telegram_msg_id)
         text += f"• {author}: {preview}\n"
         if m.author_link:
@@ -406,21 +495,26 @@ async def solve_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     p = problems[idx]
 
-    if p.status == "solved":
-        # Если уже решена — снимаем отметку
-        update_problem_status(p.id, "unsolved")
+    # Циклическое переключение: unsolved -> partial -> solved -> unsolved
+    if p.status == "unsolved":
+        update_problem_status(p.id, "partial")
         await message.reply_text(
-            f"❌ Проблема #{idx} отмечена как нерешённая\n/problem_{idx}"
+            f"🔶 Проблема #{idx} отмечена как 'есть информация'\n/problem_{idx}"
         )
-    else:
+    elif p.status == "partial":
         update_problem_status(p.id, "solved")
         await message.reply_text(
             f"✅ Проблема #{idx} отмечена как решённая!\n/problem_{idx}"
         )
+    else:  # solved
+        update_problem_status(p.id, "unsolved")
+        await message.reply_text(
+            f"❌ Проблема #{idx} отмечена как нерешённая\n/problem_{idx}"
+        )
 
 
 async def query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /query — вопрос по резюме."""
+    """Обработка команды /query — вопрос по резюме с использованием агента."""
     message = update.message
     chat_id = message.chat_id
 
@@ -431,14 +525,42 @@ async def query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     logger.info(f"/query: {question}")
 
-    await message.reply_text("Ищу ответ...")
+    # Создаём сообщение со статусом
+    status_msg = await message.reply_text("Ищу ответ...")
+    last_status_text = "Ищу ответ..."
+
+    async def on_status(state: AgentState):
+        """Callback для обновления статуса в сообщении."""
+        nonlocal last_status_text
+        if state.details:
+            new_text = f"{state.status}: {state.details}"
+        else:
+            new_text = state.status
+
+        # Обновляем только если текст изменился
+        if new_text != last_status_text:
+            last_status_text = new_text
+            try:
+                await status_msg.edit_text(new_text)
+            except Exception:
+                pass  # Игнорируем ошибки редактирования
 
     try:
-        answer = await answer_query(chat_id, question)
-        await message.reply_text(answer)
+        answer = await run_query_agent(chat_id, question, on_status)
+
+        # Удаляем сообщение со статусом и отправляем ответ
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        await send_long_message(message, answer)
     except Exception as e:
         logger.error(f"Error in query: {e}", exc_info=True)
-        await message.reply_text(f"Ошибка: {str(e)}")
+        try:
+            await status_msg.edit_text(f"Ошибка: {str(e)}")
+        except Exception:
+            await message.reply_text(f"Ошибка: {str(e)}")
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -451,13 +573,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     problems = get_problems_by_chat(chat_id)
 
     solved = sum(1 for p in problems if p.status == "solved")
-    unsolved = len(problems) - solved
+    partial = sum(1 for p in problems if p.status == "partial")
+    unsolved = len(problems) - solved - partial
 
     text = "📊 СТАТИСТИКА ЧАТА\n\n"
     text += f"Всего сообщений: {total_messages}\n"
     text += f"Необработанных: {unprocessed}\n\n"
     text += f"Всего проблем: {len(problems)}\n"
     text += f"  ✅ Решено: {solved}\n"
+    text += f"  🔶 Есть информация: {partial}\n"
     text += f"  ❌ Не решено: {unsolved}"
 
     await message.reply_text(text)
@@ -473,13 +597,32 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await message.reply_text("Все данные чата очищены.")
 
 
-async def send_long_message(message, text: str, max_length: int = 4096) -> None:
+async def send_long_message(
+    message, text: str, max_length: int = 4096, parse_mode: str = None
+) -> None:
     """Отправить длинное сообщение, разбив на части."""
+    from telegram import LinkPreviewOptions
+    from telegram.constants import ParseMode
+
+    link_preview = LinkPreviewOptions(is_disabled=True)
+
+    async def send_chunk(chunk: str):
+        """Отправить один кусок текста с fallback на plain text."""
+        try:
+            await message.reply_text(
+                chunk,
+                link_preview_options=link_preview,
+                parse_mode=parse_mode,
+            )
+        except Exception:
+            # Если Markdown не парсится — отправляем как plain text
+            await message.reply_text(chunk, link_preview_options=link_preview)
+
     if len(text) <= max_length:
-        await message.reply_text(text)
+        await send_chunk(text)
     else:
         for i in range(0, len(text), max_length):
-            await message.reply_text(text[i : i + max_length])
+            await send_chunk(text[i : i + max_length])
 
 
 def main() -> None:
@@ -491,6 +634,7 @@ def main() -> None:
 
     # Обработчики команд
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("summarize", summarize))
     application.add_handler(CommandHandler("problems", problems_list))
     application.add_handler(CommandHandler("problem", problem_detail))
@@ -513,7 +657,9 @@ def main() -> None:
 
     # Сбор сообщений — должен быть после команд
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message)
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND, collect_message
+        )
     )
 
     logger.info("Bot started")

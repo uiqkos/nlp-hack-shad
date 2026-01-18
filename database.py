@@ -26,7 +26,8 @@ class Problem:
     title: str
     short_summary: str
     long_summary: str
-    status: str  # "solved" / "unsolved"
+    solution: str  # Конкретное решение проблемы (если есть)
+    status: str  # "solved" / "partial" / "unsolved"
 
 
 def get_connection() -> sqlite3.Connection:
@@ -63,7 +64,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # Колонка уже существует
 
-    # Таблица проблем
+    # Таблица проблем (создаём если нет)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS problems (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,11 +72,18 @@ def init_db():
             title TEXT NOT NULL,
             short_summary TEXT DEFAULT '',
             long_summary TEXT DEFAULT '',
+            solution TEXT DEFAULT '',
             status TEXT DEFAULT 'unsolved',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Миграция: добавить solution если его нет
+    try:
+        conn.execute("ALTER TABLE problems ADD COLUMN solution TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
 
     # Таблица связей many-to-many между проблемами и сообщениями
     conn.execute("""
@@ -252,13 +260,14 @@ def save_problem(problem: Problem) -> int:
         conn.execute(
             """
             UPDATE problems SET
-                title = ?, short_summary = ?, long_summary = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+                title = ?, short_summary = ?, long_summary = ?, solution = ?, status = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
         """,
             (
                 problem.title,
                 problem.short_summary,
                 problem.long_summary,
+                problem.solution,
                 problem.status,
                 problem.id,
             ),
@@ -267,8 +276,8 @@ def save_problem(problem: Problem) -> int:
     else:
         cursor = conn.execute(
             """
-            INSERT INTO problems (chat_id, title, short_summary, long_summary, status)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO problems (chat_id, title, short_summary, long_summary, solution, status)
+            VALUES (?, ?, ?, ?, ?, ?)
             RETURNING id
         """,
             (
@@ -276,6 +285,7 @@ def save_problem(problem: Problem) -> int:
                 problem.title,
                 problem.short_summary,
                 problem.long_summary,
+                problem.solution,
                 problem.status,
             ),
         )
@@ -299,6 +309,7 @@ def get_problem_by_id(problem_id: int) -> Problem | None:
             title=row["title"],
             short_summary=row["short_summary"],
             long_summary=row["long_summary"],
+            solution=row["solution"] or "",
             status=row["status"],
         )
     return None
@@ -319,6 +330,7 @@ def get_problems_by_chat(chat_id: int) -> list[Problem]:
             title=row["title"],
             short_summary=row["short_summary"],
             long_summary=row["long_summary"],
+            solution=row["solution"] or "",
             status=row["status"],
         )
         for row in rows
@@ -425,6 +437,7 @@ def get_problems_for_message(message_id: int) -> list[Problem]:
             title=row["title"],
             short_summary=row["short_summary"],
             long_summary=row["long_summary"],
+            solution=row["solution"] or "",
             status=row["status"],
         )
         for row in rows
