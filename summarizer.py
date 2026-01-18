@@ -1,11 +1,11 @@
 import json
-from dataclasses import asdict
 
-from config import CHUNK_SIZE
+from config import CHUNK_SIZE, CONTEXT_MESSAGES_PER_PROBLEM
 from database import (
     Message,
     Problem,
     get_chat_meta,
+    get_message_by_telegram_id,
     get_messages_for_problem,
     get_problem_by_id,
     get_problems_by_chat,
@@ -25,17 +25,20 @@ ANALYZE_MESSAGES_PROMPT = """Проанализируй новые сообще�
 1. Какие проблемы обсуждаются (новые или обновления существующих)
 2. Общий контекст обсуждения
 
-Существующие проблемы в чате:
-{existing_problems}
+=== КОНТЕКСТ СУЩЕСТВУЮЩИХ ПРОБЛЕМ ===
+{problems_context}
 
-Новые сообщения (формат: [msg_id] автор: текст):
+=== НОВЫЕ СООБЩЕНИЯ ДЛЯ АНАЛИЗА ===
+Формат: [id] имя (reply:id_ответа): текст
+
 {messages}
 
+=== ИНСТРУКЦИИ ===
 Верни JSON:
 {{
     "new_problems": [
         {{
-            "title": "краткое название проблемы",
+            "title": "краткое название проблемы (3-7 слов)",
             "short_summary": "1-2 предложения о сути",
             "long_summary": "подробное описание проблемы и контекста",
             "status": "solved/unsolved",
@@ -46,22 +49,23 @@ ANALYZE_MESSAGES_PROMPT = """Проанализируй новые сообще�
         {{
             "problem_id": 1,
             "new_status": "solved/unsolved",
-            "additional_summary": "новая информация для добавления",
+            "additional_summary": "новая информация для добавления к описанию",
             "message_ids": [789]
         }}
     ],
-    "overview_update": "если нужно обновить общее описание чата",
+    "overview_update": "обновлённое общее описание чата (или null если не нужно)",
     "new_decisions": ["новое решение если есть"],
     "new_key_points": ["новый важный факт если есть"]
 }}
 
 Правила:
-- message_ids — это числа в квадратных скобках [msg_id] перед сообщениями
-- Если сообщение относится к существующей проблеме — добавь в problem_updates
-- Если это новая проблема — добавь в new_problems
-- Сообщение может относиться к нескольким проблемам
-- Если проблема решена в сообщениях — обнови статус на "solved"
-- Отвечай ТОЛЬКО JSON"""
+- message_ids — это числа [id] в начале каждого сообщения
+- reply:X означает что сообщение — ответ на сообщение с id=X (используй для понимания контекста)
+- Если сообщение относится к существующей проблеме — добавь в problem_updates с правильным problem_id
+- Если это новая тема/проблема — добавь в new_problems
+- Одно сообщение может относиться к нескольким проблемам
+- Если проблема решена — обнови статус на "solved"
+- Отвечай ТОЛЬКО валидным JSON"""
 
 QUERY_PROMPT = """На основе информации о чате ответь на вопрос пользователя.
 
@@ -96,40 +100,80 @@ SUMMARIZE_PROBLEM_PROMPT = """Создай подробное резюме пр�
 Отвечай ТОЛЬКО JSON."""
 
 
-def format_messages(messages: list[Message]) -> str:
-    """Форматировать сообщения для LLM."""
-    formatted = []
+def format_message_for_llm(msg: Message) -> str:
+    """Форматировать одно сообщение для LLM с reply info."""
+    author = msg.author_name or msg.author_tag or "Unknown"
+    reply_part = f" (reply:{msg.reply_to_msg_id})" if msg.reply_to_msg_id else ""
+    return f"[{msg.telegram_msg_id}] {author}{reply_part}: {msg.text}"
+
+
+def format_messages_with_context(messages: list[Message], chat_id: int) -> str:
+    """
+    Форматировать сообщения для LLM, добавляя reply-сообщения для контекста.
+    """
+    # Собираем все msg_id в текущем чанке
+    chunk_msg_ids = {msg.telegram_msg_id for msg in messages}
+
+    # Находим все reply_to_msg_id, которых нет в текущем чанке
+    needed_reply_ids = set()
     for msg in messages:
-        author = msg.author_name or msg.author_tag or "Unknown"
+        if msg.reply_to_msg_id and msg.reply_to_msg_id not in chunk_msg_ids:
+            needed_reply_ids.add(msg.reply_to_msg_id)
+
+    # Загружаем недостающие сообщения из БД
+    context_messages = []
+    for reply_id in needed_reply_ids:
+        reply_msg = get_message_by_telegram_id(chat_id, reply_id)
+        if reply_msg:
+            context_messages.append(reply_msg)
+
+    # Сортируем контекстные сообщения по id
+    context_messages.sort(key=lambda m: m.telegram_msg_id)
+
+    formatted_parts = []
+
+    # Сначала добавляем контекстные сообщения с пометкой
+    if context_messages:
+        formatted_parts.append("--- Контекст (сообщения на которые есть ответы) ---")
+        for msg in context_messages:
+            formatted_parts.append(format_message_for_llm(msg))
+        formatted_parts.append("--- Новые сообщения ---")
+
+    # Затем основные сообщения
+    for msg in messages:
         if msg.text.strip():
-            formatted.append(f"[{msg.telegram_msg_id}] {author}: {msg.text}")
-    return "\n".join(formatted)
+            formatted_parts.append(format_message_for_llm(msg))
+
+    return "\n".join(formatted_parts)
 
 
-def format_messages_from_dicts(messages: list[dict]) -> str:
-    """Форматировать сообщения из словарей (для совместимости)."""
-    formatted = []
-    for msg in messages:
-        author = msg.get("author_name") or msg.get("author", "Unknown")
-        text = msg.get("text", "")
-        msg_id = msg.get("telegram_msg_id") or msg.get("message_id", 0)
-        if text.strip():
-            formatted.append(f"[{msg_id}] {author}: {text}")
-    return "\n".join(formatted)
-
-
-def format_problems_for_llm(problems: list[Problem]) -> str:
-    """Форматировать проблемы для контекста LLM."""
+def format_problems_context(problems: list[Problem], chat_id: int) -> str:
+    """
+    Форматировать проблемы с последними сообщениями для контекста.
+    """
     if not problems:
         return "Пока нет зафиксированных проблем."
 
-    lines = []
+    parts = []
     for p in problems:
-        status = "решено" if p.status == "solved" else "не решено"
-        lines.append(f"[ID:{p.id}] {p.title} [{status}]")
-        if p.short_summary:
-            lines.append(f"   {p.short_summary}")
-    return "\n".join(lines)
+        status = "РЕШЕНО" if p.status == "solved" else "НЕ РЕШЕНО"
+        parts.append(f"[problem_id:{p.id}] {p.title} [{status}]")
+        parts.append(f"  Описание: {p.short_summary}")
+
+        # Получаем последние N сообщений для этой проблемы
+        problem_messages = get_messages_for_problem(p.id)
+        if problem_messages:
+            last_msgs = problem_messages[-CONTEXT_MESSAGES_PER_PROBLEM:]
+            parts.append(f"  Последние сообщения:")
+            for msg in last_msgs:
+                author = msg.author_name or "Unknown"
+                text_preview = (
+                    msg.text[:100] + "..." if len(msg.text) > 100 else msg.text
+                )
+                parts.append(f"    [{msg.telegram_msg_id}] {author}: {text_preview}")
+        parts.append("")  # Пустая строка между проблемами
+
+    return "\n".join(parts)
 
 
 def format_summary_for_display(chat_id: int) -> str:
@@ -140,30 +184,30 @@ def format_summary_for_display(chat_id: int) -> str:
     parts = []
 
     if meta.get("overview"):
-        parts.append(f"📋 ОБЗОР\n{meta['overview']}")
+        parts.append(f"OBZOR\n{meta['overview']}")
 
     if problems:
-        parts.append("\n🔧 ПРОБЛЕМЫ")
+        parts.append("\nPROBLEMY")
         for i, p in enumerate(problems):
-            status_icon = "✅" if p.status == "solved" else "❌"
-            parts.append(f"{i}. {status_icon} {p.title}")
+            status_icon = "+" if p.status == "solved" else "-"
+            parts.append(f"{i}. [{status_icon}] {p.title}")
             if p.short_summary:
                 parts.append(f"   {p.short_summary}")
 
     if meta.get("decisions"):
-        parts.append("\n📌 РЕШЕНИЯ")
+        parts.append("\nRESHENIYA")
         for d in meta["decisions"]:
-            parts.append(f"• {d}")
+            parts.append(f"* {d}")
 
     if meta.get("key_points"):
-        parts.append("\n💡 КЛЮЧЕВЫЕ МОМЕНТЫ")
+        parts.append("\nKLYUCHEVYE MOMENTY")
         for k in meta["key_points"]:
-            parts.append(f"• {k}")
+            parts.append(f"* {k}")
 
     return (
         "\n".join(parts)
         if parts
-        else "Резюме пока пустое. Напишите сообщения и используйте /summarize"
+        else "Rezume poka pustoe. Napishite soobscheniya i ispolzuyte /summarize"
     )
 
 
@@ -215,11 +259,14 @@ async def analyze_and_update(
         if on_progress:
             await on_progress(i + 1, len(chunks))
 
-        formatted_messages = format_messages(chunk)
-        formatted_problems = format_problems_for_llm(existing_problems)
+        # Форматируем сообщения с контекстом reply
+        formatted_messages = format_messages_with_context(chunk, chat_id)
+
+        # Форматируем проблемы с последними сообщениями
+        problems_context = format_problems_context(existing_problems, chat_id)
 
         prompt = ANALYZE_MESSAGES_PROMPT.format(
-            existing_problems=formatted_problems, messages=formatted_messages
+            problems_context=problems_context, messages=formatted_messages
         )
 
         response = await call_llm(prompt, SYSTEM_PROMPT)
@@ -304,7 +351,7 @@ async def regenerate_problem_summary(problem_id: int) -> Problem:
     if not messages:
         return problem
 
-    formatted = format_messages(messages)
+    formatted = "\n".join(format_message_for_llm(m) for m in messages)
     prompt = SUMMARIZE_PROBLEM_PROMPT.format(
         title=problem.title, current_summary=problem.long_summary, messages=formatted
     )
@@ -331,7 +378,7 @@ async def answer_query(chat_id: int, question: str) -> str:
     problems_text = []
     for p in problems:
         status = "решено" if p.status == "solved" else "не решено"
-        problems_text.append(f"• {p.title} [{status}]\n  {p.short_summary}")
+        problems_text.append(f"* {p.title} [{status}]\n  {p.short_summary}")
 
     prompt = QUERY_PROMPT.format(
         overview=meta.get("overview", "Нет общего описания"),
@@ -354,26 +401,6 @@ async def update_summary(
     on_progress: callable = None,
 ) -> dict:
     """Legacy функция для совместимости."""
-    # Конвертируем dict в Message объекты если нужно
-    messages = []
-    for msg in new_messages:
-        if isinstance(msg, Message):
-            messages.append(msg)
-        else:
-            messages.append(
-                Message(
-                    id=None,
-                    chat_id=0,  # Will be set properly in bot.py
-                    telegram_msg_id=msg.get("message_id", 0),
-                    text=msg.get("text", ""),
-                    author_tag=msg.get("author_tag", ""),
-                    author_name=msg.get("author", ""),
-                    reply_to_msg_id=msg.get("reply_to_msg_id"),
-                    telegram_link=None,
-                )
-            )
-
-    # Для legacy вызовов просто возвращаем старый формат
     return current_summary
 
 
