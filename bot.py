@@ -1,5 +1,4 @@
 import logging
-from collections import defaultdict
 
 from telegram import Update
 from telegram.ext import (
@@ -10,9 +9,24 @@ from telegram.ext import (
     filters,
 )
 
-from config import MAX_MESSAGES, TELEGRAM_BOT_TOKEN
-from database import clear_chat_data, get_chat_data, save_chat_data
-from summarizer import answer_query, format_summary_for_display, update_summary
+from config import TELEGRAM_BOT_TOKEN
+from database import (
+    Message,
+    clear_chat_data,
+    get_messages_count,
+    get_messages_for_problem,
+    get_problem_by_id,
+    get_problems_by_chat,
+    get_unprocessed_messages,
+    save_message,
+    update_problem_status,
+)
+from summarizer import (
+    analyze_and_update,
+    answer_query,
+    format_summary_for_display,
+    regenerate_problem_summary,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,250 +34,358 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# In-memory buffer for new messages (before they're processed into summary)
-# Structure: {chat_id: [messages]}
-message_buffer: dict[int, list[dict]] = defaultdict(list)
+
+def build_telegram_link(chat_id: int, message_id: int) -> str:
+    """Построить ссылку на сообщение в Telegram."""
+    # Для супергрупп chat_id начинается с -100
+    chat_id_str = str(chat_id)
+    if chat_id_str.startswith("-100"):
+        chat_id_for_link = chat_id_str[4:]  # Убираем -100
+    else:
+        chat_id_for_link = chat_id_str.lstrip("-")
+    return f"https://t.me/c/{chat_id_for_link}/{message_id}"
+
+
+def get_author_tag(user) -> str:
+    """Получить тег автора (@username или ссылку)."""
+    if not user:
+        return ""
+    if user.username:
+        return f"@{user.username}"
+    # Если нет username, делаем ссылку на профиль
+    return f"tg://user?id={user.id}"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
+    """Обработка команды /start."""
     user = update.effective_user
     logger.info(f"/start from user {user.id} ({user.first_name})")
     await update.message.reply_text(
         "Привет! Я бот для суммаризации чатов.\n\n"
-        "Я накапливаю сообщения и создаю структурированное резюме.\n\n"
+        "Я сохраняю все сообщения и создаю структурированное резюме с проблемами.\n\n"
         "Команды:\n"
-        "/summarize — обновить и показать резюме\n"
+        "/summarize — обработать новые сообщения и показать резюме\n"
+        "/problems — показать список проблем\n"
+        "/problem <номер> — подробности о проблеме\n"
+        "/messages <номер> — ссылки на сообщения проблемы\n"
+        "/solve <номер> — отметить проблему решённой\n"
         "/query <вопрос> — задать вопрос по резюме\n"
-        "/messages — показать ссылки на сообщения по проблеме\n"
-        "/clear — очистить историю"
+        "/stats — статистика чата\n"
+        "/clear — очистить всё"
     )
 
 
 async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Collect messages from any chat."""
+    """Сохранять все сообщения в БД."""
     message = update.message
     if not message or not message.text:
         return
 
     chat_id = message.chat_id
-    author = message.from_user.first_name if message.from_user else "Unknown"
+    user = message.from_user
 
-    msg_data = {
-        "author": author,
-        "text": message.text,
-        "message_id": message.message_id,
-    }
-    message_buffer[chat_id].append(msg_data)
-    logger.info(
-        f"Message from {author} in chat {chat_id}. Buffer: {len(message_buffer[chat_id])}"
+    # Создаём объект Message
+    msg = Message(
+        id=None,
+        chat_id=chat_id,
+        telegram_msg_id=message.message_id,
+        text=message.text,
+        author_tag=get_author_tag(user),
+        author_name=user.first_name if user else "Unknown",
+        reply_to_msg_id=message.reply_to_message.message_id
+        if message.reply_to_message
+        else None,
+        telegram_link=build_telegram_link(chat_id, message.message_id),
     )
 
-    # Limit buffer size
-    if len(message_buffer[chat_id]) > MAX_MESSAGES:
-        message_buffer[chat_id] = message_buffer[chat_id][-MAX_MESSAGES:]
+    # Сохраняем в БД
+    msg_id = save_message(msg)
+    logger.info(f"Message saved: id={msg_id}, from {msg.author_name} in chat {chat_id}")
 
 
 async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /summarize command — update and show summary."""
+    """Обработка команды /summarize — анализ новых сообщений."""
     message = update.message
     user = update.effective_user
     chat_id = message.chat_id
     logger.info(f"/summarize from {user.first_name} in chat {chat_id}")
 
-    # Get current data from DB
-    chat_data = get_chat_data(chat_id)
-    current_summary = chat_data["summary"]
+    # Получаем необработанные сообщения
+    new_messages = get_unprocessed_messages(chat_id)
 
-    # Get new messages from buffer
-    new_messages = message_buffer.get(chat_id, [])
-
-    if not new_messages and not current_summary.get("overview"):
-        await message.reply_text(
-            "Нет сообщений для суммаризации.\n"
-            "Напишите несколько сообщений и попробуйте снова."
-        )
+    if not new_messages:
+        # Показываем текущее резюме
+        summary_text = format_summary_for_display(chat_id)
+        await send_long_message(message, summary_text)
         return
 
-    if new_messages:
-        status_msg = await message.reply_text(
-            f"Обрабатываю {len(new_messages)} новых сообщений..."
-        )
+    status_msg = await message.reply_text(
+        f"Анализирую {len(new_messages)} новых сообщений..."
+    )
 
-        async def on_progress(current: int, total: int):
-            if total > 1:
-                try:
-                    await status_msg.edit_text(f"Обрабатываю батч {current}/{total}...")
-                except Exception:
-                    pass
-
-        try:
-            # Update summary with new messages in batches
-            updated_summary = await update_summary(
-                current_summary, new_messages, on_progress=on_progress
-            )
-
-            # Save to DB
-            last_msg_id = (
-                new_messages[-1]["message_id"]
-                if new_messages
-                else chat_data["last_message_id"]
-            )
-            save_chat_data(chat_id, updated_summary, last_msg_id)
-
-            # Clear buffer
-            message_buffer[chat_id] = []
-
-            logger.info(f"Summary updated for chat {chat_id}")
-            current_summary = updated_summary
-
+    async def on_progress(current: int, total: int):
+        if total > 1:
             try:
-                await status_msg.delete()
+                await status_msg.edit_text(f"Обрабатываю батч {current}/{total}...")
             except Exception:
                 pass
 
-        except Exception as e:
-            logger.error(f"Error updating summary: {e}", exc_info=True)
-            await message.reply_text(f"Ошибка при обновлении резюме: {str(e)}")
-            return
+    try:
+        stats = await analyze_and_update(chat_id, new_messages, on_progress)
 
-    # Show current summary
-    summary_text = format_summary_for_display(current_summary)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
-    # Split long messages (Telegram limit is 4096)
-    if len(summary_text) <= 4096:
-        await message.reply_text(summary_text)
+        # Формируем отчёт
+        report = []
+        if stats["new_problems"]:
+            report.append(f"Найдено новых проблем: {stats['new_problems']}")
+        if stats["updated_problems"]:
+            report.append(f"Обновлено проблем: {stats['updated_problems']}")
+
+        if report:
+            await message.reply_text("\n".join(report))
+
+        # Показываем резюме
+        summary_text = format_summary_for_display(chat_id)
+        await send_long_message(message, summary_text)
+
+    except Exception as e:
+        logger.error(f"Error in summarize: {e}", exc_info=True)
+        await message.reply_text(f"Ошибка при анализе: {str(e)}")
+
+
+async def problems_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /problems — список всех проблем."""
+    message = update.message
+    chat_id = message.chat_id
+
+    problems = get_problems_by_chat(chat_id)
+
+    if not problems:
+        await message.reply_text(
+            "Пока нет проблем. Напишите сообщения и используйте /summarize"
+        )
+        return
+
+    text = "📋 ПРОБЛЕМЫ:\n\n"
+    for i, p in enumerate(problems):
+        status_icon = "✅" if p.status == "solved" else "❌"
+        text += f"{i}. {status_icon} {p.title}\n"
+        if p.short_summary:
+            text += (
+                f"   {p.short_summary[:100]}...\n"
+                if len(p.short_summary) > 100
+                else f"   {p.short_summary}\n"
+            )
+        text += "\n"
+
+    text += "Используйте /problem <номер> для подробностей"
+    await send_long_message(message, text)
+
+
+async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /problem <номер> — детали проблемы."""
+    message = update.message
+    chat_id = message.chat_id
+
+    if not context.args:
+        await message.reply_text("Использование: /problem <номер>")
+        return
+
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await message.reply_text("Укажите номер проблемы (число)")
+        return
+
+    problems = get_problems_by_chat(chat_id)
+
+    if idx >= len(problems) or idx < 0:
+        await message.reply_text(
+            f"Проблема {idx} не найдена. Всего проблем: {len(problems)}"
+        )
+        return
+
+    p = problems[idx]
+    status_text = "✅ Решено" if p.status == "solved" else "❌ Не решено"
+
+    text = f"🔧 ПРОБЛЕМА #{idx}\n\n"
+    text += f"📌 {p.title}\n\n"
+    text += f"Статус: {status_text}\n\n"
+
+    if p.short_summary:
+        text += f"Кратко: {p.short_summary}\n\n"
+
+    if p.long_summary:
+        text += f"Подробно:\n{p.long_summary}\n\n"
+
+    # Количество связанных сообщений
+    msgs = get_messages_for_problem(p.id)
+    text += f"Связанных сообщений: {len(msgs)}\n"
+    text += f"Используйте /messages {idx} для просмотра ссылок"
+
+    await send_long_message(message, text)
+
+
+async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /messages <номер> — ссылки на сообщения проблемы."""
+    message = update.message
+    chat_id = message.chat_id
+
+    if not context.args:
+        await message.reply_text("Использование: /messages <номер_проблемы>")
+        return
+
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await message.reply_text("Укажите номер проблемы (число)")
+        return
+
+    problems = get_problems_by_chat(chat_id)
+
+    if idx >= len(problems) or idx < 0:
+        await message.reply_text(f"Проблема {idx} не найдена")
+        return
+
+    p = problems[idx]
+    msgs = get_messages_for_problem(p.id)
+
+    if not msgs:
+        await message.reply_text(f"Нет сообщений для проблемы {idx}")
+        return
+
+    text = f"📨 Сообщения для проблемы #{idx}:\n{p.title}\n\n"
+
+    for m in msgs[:30]:  # Лимит 30 ссылок
+        author = m.author_name or m.author_tag or "Unknown"
+        preview = m.text[:50] + "..." if len(m.text) > 50 else m.text
+        link = m.telegram_link or build_telegram_link(chat_id, m.telegram_msg_id)
+        text += f"• [{author}]: {preview}\n  {link}\n\n"
+
+    if len(msgs) > 30:
+        text += f"... и ещё {len(msgs) - 30} сообщений"
+
+    await send_long_message(message, text)
+
+
+async def solve_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /solve <номер> — отметить проблему решённой."""
+    message = update.message
+    chat_id = message.chat_id
+
+    if not context.args:
+        await message.reply_text("Использование: /solve <номер_проблемы>")
+        return
+
+    try:
+        idx = int(context.args[0])
+    except ValueError:
+        await message.reply_text("Укажите номер проблемы (число)")
+        return
+
+    problems = get_problems_by_chat(chat_id)
+
+    if idx >= len(problems) or idx < 0:
+        await message.reply_text(f"Проблема {idx} не найдена")
+        return
+
+    p = problems[idx]
+
+    if p.status == "solved":
+        # Если уже решена — снимаем отметку
+        update_problem_status(p.id, "unsolved")
+        await message.reply_text(f"❌ Проблема #{idx} отмечена как нерешённая")
     else:
-        for i in range(0, len(summary_text), 4096):
-            await message.reply_text(summary_text[i : i + 4096])
+        update_problem_status(p.id, "solved")
+        await message.reply_text(f"✅ Проблема #{idx} отмечена как решённая!")
 
 
 async def query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /query command — answer question based on summary."""
+    """Обработка команды /query — вопрос по резюме."""
     message = update.message
-    user = update.effective_user
     chat_id = message.chat_id
 
-    # Get question from command args
     question = " ".join(context.args) if context.args else ""
     if not question:
         await message.reply_text("Использование: /query <ваш вопрос>")
         return
 
-    logger.info(f"/query from {user.first_name}: {question}")
-
-    # Get summary from DB
-    chat_data = get_chat_data(chat_id)
-    current_summary = chat_data["summary"]
-
-    if not current_summary.get("overview"):
-        await message.reply_text("Резюме пока пустое. Сначала используйте /summarize")
-        return
+    logger.info(f"/query: {question}")
 
     await message.reply_text("Ищу ответ...")
 
     try:
-        answer = await answer_query(current_summary, question)
+        answer = await answer_query(chat_id, question)
         await message.reply_text(answer)
     except Exception as e:
-        logger.error(f"Error answering query: {e}", exc_info=True)
+        logger.error(f"Error in query: {e}", exc_info=True)
         await message.reply_text(f"Ошибка: {str(e)}")
 
 
-async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /messages command — show message links for a problem."""
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /stats — статистика чата."""
     message = update.message
-    user = update.effective_user
     chat_id = message.chat_id
 
-    # Get problem index from args
-    if not context.args:
-        # Show list of problems with indices
-        chat_data = get_chat_data(chat_id)
-        problems = chat_data["summary"].get("problems", [])
-        if not problems:
-            await message.reply_text("Нет проблем в резюме.")
-            return
+    total_messages = get_messages_count(chat_id)
+    unprocessed = len(get_unprocessed_messages(chat_id))
+    problems = get_problems_by_chat(chat_id)
 
-        text = "Проблемы:\n"
-        for i, p in enumerate(problems):
-            status = "solved" if p.get("status") == "solved" else "unsolved"
-            text += f"{i}: {p['problem'][:50]}... [{status}]\n"
-        text += "\nИспользуйте: /messages <номер>"
-        await message.reply_text(text)
-        return
+    solved = sum(1 for p in problems if p.status == "solved")
+    unsolved = len(problems) - solved
 
-    try:
-        problem_idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Использование: /messages <номер_проблемы>")
-        return
-
-    logger.info(f"/messages {problem_idx} from {user.first_name}")
-
-    chat_data = get_chat_data(chat_id)
-    summary = chat_data["summary"]
-    problems = summary.get("problems", [])
-    message_labels = summary.get("message_labels", {})
-
-    if problem_idx >= len(problems):
-        await message.reply_text(
-            f"Проблема {problem_idx} не найдена. Всего проблем: {len(problems)}"
-        )
-        return
-
-    # Find messages for this problem
-    msg_ids = [msg_id for msg_id, idx in message_labels.items() if idx == problem_idx]
-
-    if not msg_ids:
-        await message.reply_text(f"Нет сообщений для проблемы {problem_idx}")
-        return
-
-    # Build links (works for supergroups)
-    # Format: t.me/c/CHAT_ID/MSG_ID (without -100 prefix)
-    chat_id_for_link = str(chat_id).replace("-100", "")
-
-    problem_text = problems[problem_idx]["problem"]
-    text = f"Проблема {problem_idx}: {problem_text}\n\nСообщения:\n"
-    for msg_id in msg_ids[:20]:  # Limit to 20 links
-        text += f"• https://t.me/c/{chat_id_for_link}/{msg_id}\n"
-
-    if len(msg_ids) > 20:
-        text += f"\n...и ещё {len(msg_ids) - 20} сообщений"
+    text = "📊 СТАТИСТИКА ЧАТА\n\n"
+    text += f"Всего сообщений: {total_messages}\n"
+    text += f"Необработанных: {unprocessed}\n\n"
+    text += f"Всего проблем: {len(problems)}\n"
+    text += f"  ✅ Решено: {solved}\n"
+    text += f"  ❌ Не решено: {unsolved}"
 
     await message.reply_text(text)
 
 
 async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /clear command to reset chat history."""
+    """Обработка команды /clear — очистить все данные."""
     message = update.message
-    user = update.effective_user
     chat_id = message.chat_id
-    logger.info(f"/clear from {user.first_name} in chat {chat_id}")
+    logger.info(f"/clear in chat {chat_id}")
 
-    # Clear DB
     clear_chat_data(chat_id)
-    # Clear buffer
-    message_buffer[chat_id] = []
+    await message.reply_text("Все данные чата очищены.")
 
-    await message.reply_text("История и резюме очищены.")
+
+async def send_long_message(message, text: str, max_length: int = 4096) -> None:
+    """Отправить длинное сообщение, разбив на части."""
+    if len(text) <= max_length:
+        await message.reply_text(text)
+    else:
+        for i in range(0, len(text), max_length):
+            await message.reply_text(text[i : i + max_length])
 
 
 def main() -> None:
-    """Start the bot."""
+    """Запуск бота."""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN not set in environment")
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Command handlers
+    # Обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("summarize", summarize))
+    application.add_handler(CommandHandler("problems", problems_list))
+    application.add_handler(CommandHandler("problem", problem_detail))
+    application.add_handler(CommandHandler("messages", messages_cmd))
+    application.add_handler(CommandHandler("solve", solve_problem))
     application.add_handler(CommandHandler("query", query))
-    application.add_handler(CommandHandler("messages", messages))
+    application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("clear", clear_chat))
 
-    # Message collector - must be after command handlers
+    # Сбор сообщений — должен быть после команд
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message)
     )
