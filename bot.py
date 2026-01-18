@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 
 from telegram import Update
 from telegram.ext import (
@@ -244,10 +245,13 @@ async def problems_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    text = "📋 ПРОБЛЕМЫ:\n\n"
+    solved_count = sum(1 for p in problems if p.status == "solved")
+    unsolved_count = len(problems) - solved_count
+    text = f"📋 ПРОБЛЕМЫ ({solved_count}✅ / {unsolved_count}❌)\n\n"
+
     for i, p in enumerate(problems):
         status_icon = "✅" if p.status == "solved" else "❌"
-        text += f"{i}. {status_icon} {p.title}\n"
+        text += f"/problem_{i} {status_icon} {p.title}\n"
         if p.short_summary:
             text += (
                 f"   {p.short_summary[:100]}...\n"
@@ -256,24 +260,31 @@ async def problems_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         text += "\n"
 
-    text += "Используйте /problem <номер> для подробностей"
     await send_long_message(message, text)
 
 
 async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /problem <номер> — детали проблемы."""
+    """Обработка команды /problem <номер> или /problem_N — детали проблемы."""
     message = update.message
     chat_id = message.chat_id
 
-    if not context.args:
-        await message.reply_text("Использование: /problem <номер>")
-        return
+    # Проверяем динамическую команду /problem_N
+    idx = None
+    if message.text:
+        match = re.match(r"/problem_(\d+)", message.text)
+        if match:
+            idx = int(match.group(1))
 
-    try:
-        idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Укажите номер проблемы (число)")
-        return
+    # Если не динамическая команда, проверяем аргументы
+    if idx is None:
+        if not context.args:
+            await message.reply_text("Использование: /problem <номер> или /problem_N")
+            return
+        try:
+            idx = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Укажите номер проблемы (число)")
+            return
 
     problems = get_problems_by_chat(chat_id)
 
@@ -284,9 +295,10 @@ async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     p = problems[idx]
-    status_text = "✅ Решено" if p.status == "solved" else "❌ Не решено"
+    status_icon = "✅" if p.status == "solved" else "❌"
+    status_text = "Решено" if p.status == "solved" else "Не решено"
 
-    text = f"🔧 ПРОБЛЕМА #{idx}\n\n"
+    text = f"🔧 ПРОБЛЕМА #{idx} {status_icon}\n\n"
     text += f"📌 {p.title}\n\n"
     text += f"Статус: {status_text}\n\n"
 
@@ -298,26 +310,36 @@ async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Количество связанных сообщений
     msgs = get_messages_for_problem(p.id)
-    text += f"Связанных сообщений: {len(msgs)}\n"
-    text += f"Используйте /messages {idx} для просмотра ссылок"
+    text += f"📨 Сообщений: {len(msgs)}\n\n"
+    text += f"Действия:\n"
+    text += f"/messages_{idx} — показать сообщения\n"
+    text += f"/solve_{idx} — переключить статус"
 
     await send_long_message(message, text)
 
 
 async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /messages <номер> — ссылки на сообщения проблемы."""
+    """Обработка команды /messages <номер> или /messages_N — ссылки на сообщения проблемы."""
     message = update.message
     chat_id = message.chat_id
 
-    if not context.args:
-        await message.reply_text("Использование: /messages <номер_проблемы>")
-        return
+    # Проверяем динамическую команду /messages_N
+    idx = None
+    if message.text:
+        match = re.match(r"/messages_(\d+)", message.text)
+        if match:
+            idx = int(match.group(1))
 
-    try:
-        idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Укажите номер проблемы (число)")
-        return
+    # Если не динамическая команда, проверяем аргументы
+    if idx is None:
+        if not context.args:
+            await message.reply_text("Использование: /messages <номер> или /messages_N")
+            return
+        try:
+            idx = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Укажите номер проблемы (число)")
+            return
 
     problems = get_problems_by_chat(chat_id)
 
@@ -350,19 +372,27 @@ async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def solve_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /solve <номер> — отметить проблему решённой."""
+    """Обработка команды /solve <номер> или /solve_N — переключить статус проблемы."""
     message = update.message
     chat_id = message.chat_id
 
-    if not context.args:
-        await message.reply_text("Использование: /solve <номер_проблемы>")
-        return
+    # Проверяем динамическую команду /solve_N
+    idx = None
+    if message.text:
+        match = re.match(r"/solve_(\d+)", message.text)
+        if match:
+            idx = int(match.group(1))
 
-    try:
-        idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Укажите номер проблемы (число)")
-        return
+    # Если не динамическая команда, проверяем аргументы
+    if idx is None:
+        if not context.args:
+            await message.reply_text("Использование: /solve <номер> или /solve_N")
+            return
+        try:
+            idx = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Укажите номер проблемы (число)")
+            return
 
     problems = get_problems_by_chat(chat_id)
 
@@ -375,10 +405,14 @@ async def solve_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if p.status == "solved":
         # Если уже решена — снимаем отметку
         update_problem_status(p.id, "unsolved")
-        await message.reply_text(f"❌ Проблема #{idx} отмечена как нерешённая")
+        await message.reply_text(
+            f"❌ Проблема #{idx} отмечена как нерешённая\n/problem_{idx}"
+        )
     else:
         update_problem_status(p.id, "solved")
-        await message.reply_text(f"✅ Проблема #{idx} отмечена как решённая!")
+        await message.reply_text(
+            f"✅ Проблема #{idx} отмечена как решённая!\n/problem_{idx}"
+        )
 
 
 async def query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -461,6 +495,17 @@ def main() -> None:
     application.add_handler(CommandHandler("query", query))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("clear", clear_chat))
+
+    # Динамические команды /problem_N, /messages_N, /solve_N
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/problem_\d+"), problem_detail)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/messages_\d+"), messages_cmd)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/solve_\d+"), solve_problem)
+    )
 
     # Сбор сообщений — должен быть после команд
     application.add_handler(

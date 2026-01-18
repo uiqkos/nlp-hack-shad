@@ -208,7 +208,7 @@ def format_summary_for_display(chat_id: int) -> str:
         parts.append(f"\n🔧 ПРОБЛЕМЫ ({solved_count}✅ / {unsolved_count}❌)")
         for i, p in enumerate(problems):
             status_icon = "✅" if p.status == "solved" else "❌"
-            parts.append(f"{i}. {status_icon} {p.title}")
+            parts.append(f"/problem_{i} {status_icon} {p.title}")
             if p.short_summary:
                 parts.append(f"   {p.short_summary}")
 
