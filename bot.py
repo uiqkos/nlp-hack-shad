@@ -27,6 +27,7 @@ from summarizer import (
     format_summary_for_display,
     regenerate_problem_summary,
 )
+from llm_client import analyze_image
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -75,32 +76,102 @@ def format_author_with_link(name: str, tag: str) -> str:
     return f"{name} ({tag})"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /start."""
-    user = update.effective_user
-    logger.info(f"/start from user {user.id} ({user.first_name})")
-    await update.message.reply_text(
-        "Привет! Я бот для суммаризации чатов.\n\n"
+def build_info_text(is_private: bool) -> str:
+    """Текст справки о функционале бота."""
+    base = (
+        "Я бот для суммаризации чатов.\n\n"
         "Я сохраняю все сообщения и создаю структурированное резюме с проблемами.\n\n"
         "Команды:\n"
-        "/summarize — обработать новые сообщения и показать резюме\n"
+        "/summarize_test — обработать новые сообщения и показать резюме\n"
+        "/summarize_test — обработать новые сообщения и показать резюме\n"
         "/problems — показать список проблем\n"
         "/problem <номер> — подробности о проблеме\n"
         "/messages <номер> — ссылки на сообщения проблемы\n"
         "/solve <номер> — отметить проблему решённой\n"
         "/query <вопрос> — задать вопрос по резюме\n"
         "/stats — статистика чата\n"
-        "/clear — очистить всё"
+        "/clear_test — очистить всё\n"
+        "/clear_test — очистить всё\n"
+        "/info — описание функционала"
     )
+    if is_private:
+        return (
+            f"{base}\n\n"
+            "Добавьте меня в группу и дайте права на чтение сообщений — "
+            "тогда я смогу собирать контекст и делать резюме."
+        )
+    return base
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /start."""
+    user = update.effective_user
+    logger.info(f"/start from user {user.id} ({user.first_name})")
+    is_private = update.effective_chat.type == "private"
+    await update.message.reply_text(build_info_text(is_private))
+
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /info — справка о функционале."""
+    message = update.message
+    if not message:
+        return
+    is_private = message.chat.type == "private"
+    await message.reply_text(build_info_text(is_private))
 
 
 async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сохранять все сообщения в БД."""
+    """Сохранять все сообщения (включая картинки) в БД."""
     message = update.message
-    if not message or not message.text:
+    if not message:
+        return
+
+    if message.chat.type == "private":
+        await message.reply_text(build_info_text(is_private=True))
         return
 
     chat_id = message.chat_id
+    text = message.text or ""
+    caption = message.caption or ""
+
+    image_blocks: list[str] = []
+    prompt = (
+        "Верни строго два блока:\n"
+        "<IMAGE_DESC>краткое описание изображения</IMAGE_DESC>\n"
+        "<IMAGE_TEXT>извлечённый текст с изображения или пусто</IMAGE_TEXT>\n"
+        "Без дополнительных пояснений."
+    )
+    if caption:
+        prompt += f"\n\nПодпись пользователя: {caption}"
+
+    # Обрабатываем фото (одно сообщение может содержать несколько изображений)
+    if message.photo:
+        # Группируем по file_unique_id, чтобы обрабатывать каждое изображение один раз
+        photos_by_id = {}
+        for photo in message.photo:
+            existing = photos_by_id.get(photo.file_unique_id)
+            if not existing or (photo.file_size or 0) > (existing.file_size or 0):
+                photos_by_id[photo.file_unique_id] = photo
+
+        for photo in photos_by_id.values():
+            try:
+                file = await photo.get_file()
+                image_bytes = await file.download_as_bytearray()
+                image_description = await analyze_image(image_bytes, prompt)
+                image_blocks.append(f"<IMAGE>\n{image_description}\n</IMAGE>")
+            except Exception as e:
+                logger.error(f"Image analysis failed: {e}", exc_info=True)
+                image_blocks.append(
+                    "<IMAGE>\n<IMAGE_DESC>Не удалось проанализировать</IMAGE_DESC>\n"
+                    "<IMAGE_TEXT></IMAGE_TEXT>\n</IMAGE>"
+                )
+
+    if image_blocks:
+        image_list = "<IMAGE_LIST>\n" + "\n".join(image_blocks) + "\n</IMAGE_LIST>"
+        text = f"{image_list}\n\n{caption or text}".strip() if (caption or text) else image_list
+
+    if not text:
+        return
 
     # Определяем автора: если пересланное — берём оригинального автора
     author_name = "Unknown"
@@ -145,7 +216,7 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         id=None,
         chat_id=chat_id,
         telegram_msg_id=message.message_id,
-        text=message.text,
+        text=text,
         author_tag=author_tag,
         author_name=author_name,
         reply_to_msg_id=message.reply_to_message.message_id
@@ -160,11 +231,11 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /summarize — анализ новых сообщений."""
+    """Обработка команды /summarize_test — анализ новых сообщений."""
     message = update.message
     user = update.effective_user
     chat_id = message.chat_id
-    logger.info(f"/summarize from {user.first_name} in chat {chat_id}")
+    logger.info(f"/summarize_test from {user.first_name} in chat {chat_id}")
 
     # Получаем необработанные сообщения
     new_messages = get_unprocessed_messages(chat_id)
@@ -405,10 +476,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /clear — очистить все данные."""
+    """Обработка команды /clear_test — очистить все данные."""
     message = update.message
     chat_id = message.chat_id
-    logger.info(f"/clear in chat {chat_id}")
+    logger.info(f"/clear_test in chat {chat_id}")
 
     clear_chat_data(chat_id)
     await message.reply_text("Все данные чата очищены.")
@@ -432,18 +503,19 @@ def main() -> None:
 
     # Обработчики команд
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("summarize", summarize))
+    application.add_handler(CommandHandler("info", info))
+    application.add_handler(CommandHandler("summarize_test", summarize))
     application.add_handler(CommandHandler("problems", problems_list))
     application.add_handler(CommandHandler("problem", problem_detail))
     application.add_handler(CommandHandler("messages", messages_cmd))
     application.add_handler(CommandHandler("solve", solve_problem))
     application.add_handler(CommandHandler("query", query))
     application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("clear", clear_chat))
+    application.add_handler(CommandHandler("clear_test", clear_chat))
 
     # Сбор сообщений — должен быть после команд
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message)
+        MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, collect_message)
     )
 
     logger.info("Bot started")
