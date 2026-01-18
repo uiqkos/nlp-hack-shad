@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 
 from telegram import Update
 from telegram.ext import (
@@ -30,9 +32,11 @@ from summarizer import (
 )
 from llm_client import analyze_image
 
+# Set log level from env: DEBUG for verbose LLM logging, INFO for normal
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger(__name__)
 
@@ -49,13 +53,12 @@ def build_telegram_link(chat_id: int, message_id: int) -> str:
 
 
 def get_author_tag(user) -> str:
-    """Получить тег автора (@username или ссылку)."""
+    """Получить тег автора (username без @)."""
     if not user:
         return ""
     if user.username:
-        return f"@{user.username}"
-    # Если нет username, делаем ссылку на профиль
-    return f"tg://user?id={user.id}"
+        return user.username
+    return ""
 
 
 def get_author_name(user) -> str:
@@ -70,11 +73,20 @@ def get_author_name(user) -> str:
     return " ".join(parts) if parts else "Unknown"
 
 
-def format_author_with_link(name: str, tag: str) -> str:
-    """Форматировать имя автора со ссылкой в скобках."""
-    if not tag:
-        return name
-    return f"{name} ({tag})"
+def build_user_link(user) -> str:
+    """Построить ссылку на профиль пользователя."""
+    if not user:
+        return ""
+    if user.username:
+        return f"https://t.me/{user.username}"
+    return f"tg://user?id={user.id}"
+
+
+def format_author_display(name: str, tag: str) -> str:
+    """Форматировать имя автора с тегом в скобках."""
+    if tag:
+        return f"{name} ({tag})"
+    return name
 
 
 def build_info_text(is_private: bool) -> str:
@@ -131,6 +143,10 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(build_info_text(is_private=True))
         return
 
+    # Игнорируем сообщения от самого бота
+    if message.from_user and message.from_user.id == context.bot.id:
+        return
+
     chat_id = message.chat_id
     text = message.text or ""
     caption = message.caption or ""
@@ -182,6 +198,7 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Определяем автора: если пересланное — берём оригинального автора
     author_name = "Unknown"
     author_tag = ""
+    author_link = ""
 
     if message.forward_origin:
         # Пересланное сообщение — берём оригинального автора
@@ -197,25 +214,30 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Переслано от пользователя
             author_name = get_author_name(origin.sender_user)
             author_tag = get_author_tag(origin.sender_user)
+            author_link = build_user_link(origin.sender_user)
         elif isinstance(origin, MessageOriginHiddenUser):
             # Скрытый пользователь
             author_name = origin.sender_user_name
             author_tag = ""
+            author_link = ""
         elif isinstance(origin, MessageOriginChat):
             # Переслано от имени чата/группы
             author_name = origin.sender_chat.title or "Chat"
             if origin.sender_chat.username:
-                author_tag = f"@{origin.sender_chat.username}"
+                author_tag = origin.sender_chat.username
+                author_link = f"https://t.me/{origin.sender_chat.username}"
         elif isinstance(origin, MessageOriginChannel):
             # Переслано из канала
             author_name = origin.chat.title or "Channel"
             if origin.chat.username:
-                author_tag = f"@{origin.chat.username}"
+                author_tag = origin.chat.username
+                author_link = f"https://t.me/{origin.chat.username}"
     else:
         # Обычное сообщение
         user = message.from_user
         author_name = get_author_name(user)
         author_tag = get_author_tag(user)
+        author_link = build_user_link(user)
 
     # Создаём объект Message
     msg = Message(
@@ -225,6 +247,7 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text=text,
         author_tag=author_tag,
         author_name=author_name,
+        author_link=author_link,
         reply_to_msg_id=message.reply_to_message.message_id
         if message.reply_to_message
         else None,
@@ -303,10 +326,13 @@ async def problems_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    text = "📋 ПРОБЛЕМЫ:\n\n"
+    solved_count = sum(1 for p in problems if p.status == "solved")
+    unsolved_count = len(problems) - solved_count
+    text = f"📋 ПРОБЛЕМЫ ({solved_count}✅ / {unsolved_count}❌)\n\n"
+
     for i, p in enumerate(problems):
         status_icon = "✅" if p.status == "solved" else "❌"
-        text += f"{i}. {status_icon} {p.title}\n"
+        text += f"/problem_{i} {status_icon} {p.title}\n"
         if p.short_summary:
             text += (
                 f"   {p.short_summary[:100]}...\n"
@@ -315,24 +341,31 @@ async def problems_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         text += "\n"
 
-    text += "Используйте /problem <номер> для подробностей"
     await send_long_message(message, text)
 
 
 async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /problem <номер> — детали проблемы."""
+    """Обработка команды /problem <номер> или /problem_N — детали проблемы."""
     message = update.message
     chat_id = message.chat_id
 
-    if not context.args:
-        await message.reply_text("Использование: /problem <номер>")
-        return
+    # Проверяем динамическую команду /problem_N
+    idx = None
+    if message.text:
+        match = re.match(r"/problem_(\d+)", message.text)
+        if match:
+            idx = int(match.group(1))
 
-    try:
-        idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Укажите номер проблемы (число)")
-        return
+    # Если не динамическая команда, проверяем аргументы
+    if idx is None:
+        if not context.args:
+            await message.reply_text("Использование: /problem <номер> или /problem_N")
+            return
+        try:
+            idx = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Укажите номер проблемы (число)")
+            return
 
     problems = get_problems_by_chat(chat_id)
 
@@ -343,9 +376,10 @@ async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     p = problems[idx]
-    status_text = "✅ Решено" if p.status == "solved" else "❌ Не решено"
+    status_icon = "✅" if p.status == "solved" else "❌"
+    status_text = "Решено" if p.status == "solved" else "Не решено"
 
-    text = f"🔧 ПРОБЛЕМА #{idx}\n\n"
+    text = f"🔧 ПРОБЛЕМА #{idx} {status_icon}\n\n"
     text += f"📌 {p.title}\n\n"
     text += f"Статус: {status_text}\n\n"
 
@@ -357,26 +391,36 @@ async def problem_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Количество связанных сообщений
     msgs = get_messages_for_problem(p.id)
-    text += f"Связанных сообщений: {len(msgs)}\n"
-    text += f"Используйте /messages {idx} для просмотра ссылок"
+    text += f"📨 Сообщений: {len(msgs)}\n\n"
+    text += f"Действия:\n"
+    text += f"/messages_{idx} — показать сообщения\n"
+    text += f"/solve_{idx} — переключить статус"
 
     await send_long_message(message, text)
 
 
 async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /messages <номер> — ссылки на сообщения проблемы."""
+    """Обработка команды /messages <номер> или /messages_N — ссылки на сообщения проблемы."""
     message = update.message
     chat_id = message.chat_id
 
-    if not context.args:
-        await message.reply_text("Использование: /messages <номер_проблемы>")
-        return
+    # Проверяем динамическую команду /messages_N
+    idx = None
+    if message.text:
+        match = re.match(r"/messages_(\d+)", message.text)
+        if match:
+            idx = int(match.group(1))
 
-    try:
-        idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Укажите номер проблемы (число)")
-        return
+    # Если не динамическая команда, проверяем аргументы
+    if idx is None:
+        if not context.args:
+            await message.reply_text("Использование: /messages <номер> или /messages_N")
+            return
+        try:
+            idx = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Укажите номер проблемы (число)")
+            return
 
     problems = get_problems_by_chat(chat_id)
 
@@ -394,10 +438,13 @@ async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = f"📨 Сообщения для проблемы #{idx}:\n{p.title}\n\n"
 
     for m in msgs[:30]:  # Лимит 30 ссылок
-        author = format_author_with_link(m.author_name or "Unknown", m.author_tag)
+        author = format_author_display(m.author_name or "Unknown", m.author_tag)
         preview = m.text[:50] + "..." if len(m.text) > 50 else m.text
-        link = m.telegram_link or build_telegram_link(chat_id, m.telegram_msg_id)
-        text += f"• {author}: {preview}\n  {link}\n\n"
+        msg_link = m.telegram_link or build_telegram_link(chat_id, m.telegram_msg_id)
+        text += f"• {author}: {preview}\n"
+        if m.author_link:
+            text += f"  Профиль: {m.author_link}\n"
+        text += f"  Сообщение: {msg_link}\n\n"
 
     if len(msgs) > 30:
         text += f"... и ещё {len(msgs) - 30} сообщений"
@@ -406,19 +453,27 @@ async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def solve_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка команды /solve <номер> — отметить проблему решённой."""
+    """Обработка команды /solve <номер> или /solve_N — переключить статус проблемы."""
     message = update.message
     chat_id = message.chat_id
 
-    if not context.args:
-        await message.reply_text("Использование: /solve <номер_проблемы>")
-        return
+    # Проверяем динамическую команду /solve_N
+    idx = None
+    if message.text:
+        match = re.match(r"/solve_(\d+)", message.text)
+        if match:
+            idx = int(match.group(1))
 
-    try:
-        idx = int(context.args[0])
-    except ValueError:
-        await message.reply_text("Укажите номер проблемы (число)")
-        return
+    # Если не динамическая команда, проверяем аргументы
+    if idx is None:
+        if not context.args:
+            await message.reply_text("Использование: /solve <номер> или /solve_N")
+            return
+        try:
+            idx = int(context.args[0])
+        except ValueError:
+            await message.reply_text("Укажите номер проблемы (число)")
+            return
 
     problems = get_problems_by_chat(chat_id)
 
@@ -431,10 +486,14 @@ async def solve_problem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if p.status == "solved":
         # Если уже решена — снимаем отметку
         update_problem_status(p.id, "unsolved")
-        await message.reply_text(f"❌ Проблема #{idx} отмечена как нерешённая")
+        await message.reply_text(
+            f"❌ Проблема #{idx} отмечена как нерешённая\n/problem_{idx}"
+        )
     else:
         update_problem_status(p.id, "solved")
-        await message.reply_text(f"✅ Проблема #{idx} отмечена как решённая!")
+        await message.reply_text(
+            f"✅ Проблема #{idx} отмечена как решённая!\n/problem_{idx}"
+        )
 
 
 async def query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -531,6 +590,17 @@ def main() -> None:
     application.add_handler(CommandHandler("query", query))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("clear_test", clear_chat))
+
+    # Динамические команды /problem_N, /messages_N, /solve_N
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/problem_\d+"), problem_detail)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/messages_\d+"), messages_cmd)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(r"^/solve_\d+"), solve_problem)
+    )
 
     # Сбор сообщений — должен быть после команд
     application.add_handler(

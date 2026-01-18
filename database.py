@@ -12,8 +12,9 @@ class Message:
     chat_id: int
     telegram_msg_id: int
     text: str
-    author_tag: str  # @username или ссылка
+    author_tag: str  # username без @
     author_name: str  # Отображаемое имя
+    author_link: str | None  # Ссылка на профиль автора
     reply_to_msg_id: int | None  # ID сообщения, на которое ответили
     telegram_link: str | None  # Ссылка на сообщение в Telegram
 
@@ -48,12 +49,19 @@ def init_db():
             text TEXT NOT NULL,
             author_tag TEXT,
             author_name TEXT,
+            author_link TEXT,
             reply_to_msg_id INTEGER,
             telegram_link TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(chat_id, telegram_msg_id)
         )
     """)
+
+    # Миграция: добавить author_link если его нет
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN author_link TEXT")
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
 
     # Таблица проблем
     conn.execute("""
@@ -110,12 +118,13 @@ def save_message(msg: Message) -> int:
     conn = get_connection()
     cursor = conn.execute(
         """
-        INSERT INTO messages (chat_id, telegram_msg_id, text, author_tag, author_name, reply_to_msg_id, telegram_link)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (chat_id, telegram_msg_id, text, author_tag, author_name, author_link, reply_to_msg_id, telegram_link)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id, telegram_msg_id) DO UPDATE SET
             text = excluded.text,
             author_tag = excluded.author_tag,
             author_name = excluded.author_name,
+            author_link = excluded.author_link,
             reply_to_msg_id = excluded.reply_to_msg_id,
             telegram_link = excluded.telegram_link
         RETURNING id
@@ -126,6 +135,7 @@ def save_message(msg: Message) -> int:
             msg.text,
             msg.author_tag,
             msg.author_name,
+            msg.author_link,
             msg.reply_to_msg_id,
             msg.telegram_link,
         ),
@@ -153,6 +163,7 @@ def get_message_by_telegram_id(chat_id: int, telegram_msg_id: int) -> Message | 
             text=row["text"],
             author_tag=row["author_tag"],
             author_name=row["author_name"],
+            author_link=row["author_link"],
             reply_to_msg_id=row["reply_to_msg_id"],
             telegram_link=row["telegram_link"],
         )
@@ -182,6 +193,7 @@ def get_messages_by_chat(
             text=row["text"],
             author_tag=row["author_tag"],
             author_name=row["author_name"],
+            author_link=row["author_link"],
             reply_to_msg_id=row["reply_to_msg_id"],
             telegram_link=row["telegram_link"],
         )
@@ -211,6 +223,7 @@ def get_unprocessed_messages(chat_id: int) -> list[Message]:
             text=row["text"],
             author_tag=row["author_tag"],
             author_name=row["author_name"],
+            author_link=row["author_link"],
             reply_to_msg_id=row["reply_to_msg_id"],
             telegram_link=row["telegram_link"],
         )
@@ -384,6 +397,7 @@ def get_messages_for_problem(problem_id: int) -> list[Message]:
             text=row["text"],
             author_tag=row["author_tag"],
             author_name=row["author_name"],
+            author_link=row["author_link"],
             reply_to_msg_id=row["reply_to_msg_id"],
             telegram_link=row["telegram_link"],
         )

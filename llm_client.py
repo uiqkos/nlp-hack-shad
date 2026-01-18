@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+
 import httpx
 
 from config import OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_VISION_MODEL
@@ -19,6 +20,16 @@ async def call_llm(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
+    # Debug logging
+    logger.debug("=" * 60)
+    logger.debug(f"LLM REQUEST to {model}")
+    logger.debug("=" * 60)
+    if system_prompt:
+        logger.debug(f"[SYSTEM PROMPT]\n{system_prompt}")
+        logger.debug("-" * 40)
+    logger.debug(f"[USER PROMPT]\n{prompt}")
+    logger.debug("=" * 60)
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         for attempt in range(3):
             try:
@@ -35,7 +46,12 @@ async def call_llm(
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data["choices"][0]["message"]["content"]
+                result = data["choices"][0]["message"]["content"]
+
+                logger.debug(f"[LLM RESPONSE]\n{result}")
+                logger.debug("=" * 60)
+
+                return result
             except (
                 httpx.RemoteProtocolError,
                 httpx.ConnectError,
