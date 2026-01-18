@@ -56,6 +56,25 @@ def get_author_tag(user) -> str:
     return f"tg://user?id={user.id}"
 
 
+def get_author_name(user) -> str:
+    """Получить отображаемое имя пользователя."""
+    if not user:
+        return "Unknown"
+    parts = []
+    if user.first_name:
+        parts.append(user.first_name)
+    if user.last_name:
+        parts.append(user.last_name)
+    return " ".join(parts) if parts else "Unknown"
+
+
+def format_author_with_link(name: str, tag: str) -> str:
+    """Форматировать имя автора со ссылкой в скобках."""
+    if not tag:
+        return name
+    return f"{name} ({tag})"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка команды /start."""
     user = update.effective_user
@@ -82,7 +101,44 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     chat_id = message.chat_id
-    user = message.from_user
+
+    # Определяем автора: если пересланное — берём оригинального автора
+    author_name = "Unknown"
+    author_tag = ""
+
+    if message.forward_origin:
+        # Пересланное сообщение — берём оригинального автора
+        from telegram import (
+            MessageOriginChannel,
+            MessageOriginChat,
+            MessageOriginHiddenUser,
+            MessageOriginUser,
+        )
+
+        origin = message.forward_origin
+        if isinstance(origin, MessageOriginUser):
+            # Переслано от пользователя
+            author_name = get_author_name(origin.sender_user)
+            author_tag = get_author_tag(origin.sender_user)
+        elif isinstance(origin, MessageOriginHiddenUser):
+            # Скрытый пользователь
+            author_name = origin.sender_user_name
+            author_tag = ""
+        elif isinstance(origin, MessageOriginChat):
+            # Переслано от имени чата/группы
+            author_name = origin.sender_chat.title or "Chat"
+            if origin.sender_chat.username:
+                author_tag = f"@{origin.sender_chat.username}"
+        elif isinstance(origin, MessageOriginChannel):
+            # Переслано из канала
+            author_name = origin.chat.title or "Channel"
+            if origin.chat.username:
+                author_tag = f"@{origin.chat.username}"
+    else:
+        # Обычное сообщение
+        user = message.from_user
+        author_name = get_author_name(user)
+        author_tag = get_author_tag(user)
 
     # Создаём объект Message
     msg = Message(
@@ -90,8 +146,8 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chat_id=chat_id,
         telegram_msg_id=message.message_id,
         text=message.text,
-        author_tag=get_author_tag(user),
-        author_name=user.first_name if user else "Unknown",
+        author_tag=author_tag,
+        author_name=author_name,
         reply_to_msg_id=message.reply_to_message.message_id
         if message.reply_to_message
         else None,
@@ -261,10 +317,10 @@ async def messages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = f"📨 Сообщения для проблемы #{idx}:\n{p.title}\n\n"
 
     for m in msgs[:30]:  # Лимит 30 ссылок
-        author = m.author_name or m.author_tag or "Unknown"
+        author = format_author_with_link(m.author_name or "Unknown", m.author_tag)
         preview = m.text[:50] + "..." if len(m.text) > 50 else m.text
         link = m.telegram_link or build_telegram_link(chat_id, m.telegram_msg_id)
-        text += f"• [{author}]: {preview}\n  {link}\n\n"
+        text += f"• {author}: {preview}\n  {link}\n\n"
 
     if len(msgs) > 30:
         text += f"... и ещё {len(msgs) - 30} сообщений"
